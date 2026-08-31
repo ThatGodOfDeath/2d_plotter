@@ -26,16 +26,17 @@ DEFAULT_PEN_UP = 90
 DEFAULT_PEN_DOWN = 30
 
 # Toolpath filtering
-MIN_CONTOUR_LENGTH = 20
-MIN_PATH_LENGTH = 2.0
+MIN_CONTOUR_LENGTH = 15
+MIN_CONTOUR_AREA = 5
+MIN_PATH_LENGTH = 1.5
 
 # Contour simplification
 SIMPLIFY_EPSILON = 0.8
 
-# Morphological cleanup
+# Image cleanup
 MORPH_KERNEL_SIZE = 3
 
-# Remove points that are extremely close together
+# Remove points that are extremely close
 MIN_POINT_DISTANCE = 0.2
 
 
@@ -114,7 +115,7 @@ def process_image():
         cv2.COLOR_BGR2GRAY
     )
 
-    # Slight blur removes pixel-level noise
+    # Slight blur removes tiny pixel noise
     gray = cv2.GaussianBlur(
         gray,
         (3, 3),
@@ -147,7 +148,10 @@ def process_image():
         edges = cv2.Canny(
             gray,
             threshold,
-            min(255, threshold * 2)
+            min(
+                255,
+                threshold * 2
+            )
         )
 
         processed = edges
@@ -219,6 +223,18 @@ def show_image(img):
 
 
 # ============================================================
+# DISTANCE
+# ============================================================
+
+def distance(a, b):
+
+    return math.hypot(
+        b[0] - a[0],
+        b[1] - a[1]
+    )
+
+
+# ============================================================
 # REMOVE CLOSE POINTS
 # ============================================================
 
@@ -243,6 +259,47 @@ def remove_close_points(path):
             )
 
     return cleaned
+
+
+# ============================================================
+# PATH LENGTH
+# ============================================================
+
+def calculate_path_length(
+    path,
+    closed=False
+):
+
+    if len(path) < 2:
+        return 0
+
+    total = 0
+
+    for i in range(
+        1,
+        len(path)
+    ):
+
+        x1, y1 = path[i - 1]
+        x2, y2 = path[i]
+
+        total += math.hypot(
+            x2 - x1,
+            y2 - y1
+        )
+
+    # Close contour
+    if closed and len(path) >= 3:
+
+        x1, y1 = path[-1]
+        x2, y2 = path[0]
+
+        total += math.hypot(
+            x2 - x1,
+            y2 - y1
+        )
+
+    return total
 
 
 # ============================================================
@@ -295,18 +352,40 @@ def generate_toolpaths():
         return
 
     # ========================================================
-    # CREATE BINARY IMAGE
+    # COPY IMAGE
     # ========================================================
 
     img = image_processed.copy()
 
-    if processing_mode.get() == "Edge Detection":
+    mode = processing_mode.get()
 
+    # ========================================================
+    # CREATE BINARY IMAGE
+    # ========================================================
+
+    if mode == "Edge Detection":
+
+        # Canny already gives a binary image
         binary = img.copy()
+
+        # Close small gaps in edge lines
+        kernel = np.ones(
+            (
+                MORPH_KERNEL_SIZE,
+                MORPH_KERNEL_SIZE
+            ),
+            np.uint8
+        )
+
+        binary = cv2.morphologyEx(
+            binary,
+            cv2.MORPH_CLOSE,
+            kernel
+        )
 
     else:
 
-        # Convert black objects into white contours
+        # Convert black areas to white
         _, binary = cv2.threshold(
             img,
             127,
@@ -314,43 +393,57 @@ def generate_toolpaths():
             cv2.THRESH_BINARY_INV
         )
 
-    # ========================================================
-    # MORPHOLOGICAL CLEANUP
-    # ========================================================
+        kernel = np.ones(
+            (
+                MORPH_KERNEL_SIZE,
+                MORPH_KERNEL_SIZE
+            ),
+            np.uint8
+        )
 
-    kernel = np.ones(
-        (
-            MORPH_KERNEL_SIZE,
-            MORPH_KERNEL_SIZE
-        ),
-        np.uint8
-    )
+        # Remove tiny isolated noise
+        binary = cv2.morphologyEx(
+            binary,
+            cv2.MORPH_OPEN,
+            kernel
+        )
 
-    # Remove isolated tiny noise
-    binary = cv2.morphologyEx(
-        binary,
-        cv2.MORPH_OPEN,
-        kernel
-    )
-
-    # Connect tiny gaps
-    binary = cv2.morphologyEx(
-        binary,
-        cv2.MORPH_CLOSE,
-        kernel
-    )
+        # Connect small gaps
+        binary = cv2.morphologyEx(
+            binary,
+            cv2.MORPH_CLOSE,
+            kernel
+        )
 
     # ========================================================
     # FIND CONTOURS
     # ========================================================
 
-    contours, _ = cv2.findContours(
+    contours, hierarchy = cv2.findContours(
         binary,
-        cv2.RETR_EXTERNAL,
+        cv2.RETR_CCOMP,
         cv2.CHAIN_APPROX_SIMPLE
     )
 
+    if hierarchy is None:
+
+        toolpaths = []
+
+        draw_toolpath_preview()
+
+        status_var.set(
+            "No contours found"
+        )
+
+        return
+
+    hierarchy = hierarchy[0]
+
     h, w = binary.shape
+
+    # ========================================================
+    # PIXEL → MM SCALE
+    # ========================================================
 
     scale_x = width_mm / w
     scale_y = height_mm / h
@@ -358,16 +451,29 @@ def generate_toolpaths():
     paths = []
 
     # ========================================================
-    # PROCESS EACH CONTOUR
+    # PROCESS CONTOURS
     # ========================================================
 
-    for contour in contours:
+    for i, contour in enumerate(contours):
 
         if len(contour) < 3:
             continue
 
         # ----------------------------------------------------
-        # CONTOUR PERIMETER
+        # AREA FILTER
+        # ----------------------------------------------------
+
+        area = abs(
+            cv2.contourArea(
+                contour
+            )
+        )
+
+        if area < MIN_CONTOUR_AREA:
+            continue
+
+        # ----------------------------------------------------
+        # PERIMETER
         # ----------------------------------------------------
 
         perimeter = cv2.arcLength(
@@ -379,7 +485,7 @@ def generate_toolpaths():
             continue
 
         # ----------------------------------------------------
-        # SIMPLIFY CONTOUR
+        # SIMPLIFY
         # ----------------------------------------------------
 
         simplified = cv2.approxPolyDP(
@@ -392,7 +498,7 @@ def generate_toolpaths():
             continue
 
         # ----------------------------------------------------
-        # CONVERT PIXELS → MM
+        # CONVERT TO MM
         # ----------------------------------------------------
 
         path = []
@@ -418,7 +524,7 @@ def generate_toolpaths():
             )
 
         # ----------------------------------------------------
-        # REMOVE VERY CLOSE POINTS
+        # REMOVE CLOSE POINTS
         # ----------------------------------------------------
 
         path = remove_close_points(
@@ -429,7 +535,7 @@ def generate_toolpaths():
             continue
 
         # ----------------------------------------------------
-        # CALCULATE LENGTH
+        # LENGTH FILTER
         # ----------------------------------------------------
 
         length = calculate_path_length(
@@ -440,13 +546,17 @@ def generate_toolpaths():
         if length < MIN_PATH_LENGTH:
             continue
 
-        # ----------------------------------------------------
-        # STORE
-        # ----------------------------------------------------
-
         paths.append(
             path
         )
+
+    # ========================================================
+    # REMOVE DUPLICATES
+    # ========================================================
+
+    paths = remove_duplicate_paths(
+        paths
+    )
 
     # ========================================================
     # OPTIMIZE PATH ORDER
@@ -468,56 +578,107 @@ def generate_toolpaths():
 
 
 # ============================================================
-# PATH LENGTH
+# REMOVE DUPLICATE PATHS
 # ============================================================
 
-def calculate_path_length(
-    path,
-    closed=False
-):
+def remove_duplicate_paths(paths):
 
-    if len(path) < 2:
-        return 0
+    if not paths:
+        return []
 
-    total = 0
+    unique = []
 
-    for i in range(
-        1,
-        len(path)
-    ):
+    for path in paths:
 
-        x1, y1 = path[i - 1]
-        x2, y2 = path[i]
+        is_duplicate = False
 
-        total += math.hypot(
-            x2 - x1,
-            y2 - y1
-        )
+        xs = [
+            p[0]
+            for p in path
+        ]
 
-    # Close contour
-    if closed and len(path) >= 3:
+        ys = [
+            p[1]
+            for p in path
+        ]
 
-        x1, y1 = path[-1]
-        x2, y2 = path[0]
+        min_x = min(xs)
+        max_x = max(xs)
 
-        total += math.hypot(
-            x2 - x1,
-            y2 - y1
-        )
+        min_y = min(ys)
+        max_y = max(ys)
 
-    return total
+        width = max_x - min_x
+        height = max_y - min_y
 
+        for existing in unique:
 
-# ============================================================
-# DISTANCE
-# ============================================================
+            ex = [
+                p[0]
+                for p in existing
+            ]
 
-def distance(a, b):
+            ey = [
+                p[1]
+                for p in existing
+            ]
 
-    return math.hypot(
-        b[0] - a[0],
-        b[1] - a[1]
-    )
+            e_min_x = min(ex)
+            e_max_x = max(ex)
+
+            e_min_y = min(ey)
+            e_max_y = max(ey)
+
+            e_width = e_max_x - e_min_x
+            e_height = e_max_y - e_min_y
+
+            # ------------------------------------------------
+            # Compare bounding boxes
+            # ------------------------------------------------
+
+            if (
+                abs(
+                    min_x -
+                    e_min_x
+                ) < 0.5
+                and
+                abs(
+                    max_x -
+                    e_max_x
+                ) < 0.5
+                and
+                abs(
+                    min_y -
+                    e_min_y
+                ) < 0.5
+                and
+                abs(
+                    max_y -
+                    e_max_y
+                ) < 0.5
+                and
+                abs(
+                    width -
+                    e_width
+                ) < 0.5
+                and
+                abs(
+                    height -
+                    e_height
+                ) < 0.5
+            ):
+
+                is_duplicate = True
+
+                break
+
+        if not is_duplicate:
+
+            unique.append(
+                path
+            )
+
+    return unique
 
 
 # ============================================================
@@ -555,6 +716,7 @@ def optimize_paths(paths):
     while remaining:
 
         best_index = 0
+
         best_distance = float(
             "inf"
         )
@@ -582,13 +744,17 @@ def optimize_paths(paths):
             if d_start < best_distance:
 
                 best_distance = d_start
+
                 best_index = i
+
                 best_reverse = False
 
             if d_end < best_distance:
 
                 best_distance = d_end
+
                 best_index = i
+
                 best_reverse = True
 
         # ----------------------------------------------------
@@ -600,7 +766,7 @@ def optimize_paths(paths):
         )
 
         # ----------------------------------------------------
-        # REVERSE IF NEEDED
+        # REVERSE IF CLOSER
         # ----------------------------------------------------
 
         if best_reverse:
@@ -675,7 +841,7 @@ def draw_toolpath_preview():
     )
 
     # ========================================================
-    # DRAW TOOLPATHS
+    # DRAW PATHS
     # ========================================================
 
     previous_end = None
@@ -713,7 +879,6 @@ def draw_toolpath_preview():
                 start[1] * scale
             )
 
-            # Dashed line represents PEN UP movement
             canvas.create_line(
                 x1,
                 y1,
@@ -724,7 +889,7 @@ def draw_toolpath_preview():
             )
 
         # ----------------------------------------------------
-        # DRAW PATH
+        # DRAW CONTOUR
         # ----------------------------------------------------
 
         points = []
@@ -748,13 +913,16 @@ def draw_toolpath_preview():
                 ]
             )
 
-        # Close contour visually
+        # Close contour in preview
         x0, y0 = path[0]
 
         points.extend(
             [
-                offset_x + x0 * scale,
-                offset_y + y0 * scale
+                offset_x +
+                x0 * scale,
+
+                offset_y +
+                y0 * scale
             ]
         )
 
@@ -805,7 +973,6 @@ def connect_serial():
 
     try:
 
-        # Close previous connection
         if ser is not None:
 
             try:
@@ -822,7 +989,6 @@ def connect_serial():
         # Arduino reset delay
         time.sleep(2)
 
-        # Clear any startup garbage
         ser.reset_input_buffer()
         ser.reset_output_buffer()
 
@@ -865,7 +1031,7 @@ def send_command(command):
         ser.flush()
 
         # Wait for Arduino response
-        response = ser.readline()
+        ser.readline()
 
         return True
 
@@ -1014,7 +1180,7 @@ def plot_thread():
             # ------------------------------------------------
             # DRAW
             # ------------------------------------------------
-            # Start from SECOND point because first point
+            # Start at second point because the first point
             # has already been reached.
             # ------------------------------------------------
 
@@ -1335,9 +1501,7 @@ tk.Label(
     pady=(15, 0)
 )
 
-
 port_var = tk.StringVar()
-
 
 port_combo = ttk.Combobox(
     left,
