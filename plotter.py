@@ -11,7 +11,7 @@ import math
 
 
 # ============================================================
-# SETTINGS
+# DEFAULT SETTINGS
 # ============================================================
 
 BAUD_RATE = 115200
@@ -25,19 +25,17 @@ DEFAULT_HEIGHT = 100
 DEFAULT_PEN_UP = 90
 DEFAULT_PEN_DOWN = 30
 
-# Toolpath filtering
-MIN_CONTOUR_LENGTH = 15
-MIN_CONTOUR_AREA = 5
-MIN_PATH_LENGTH = 1.5
+DEFAULT_THRESHOLD = 150
 
-# Contour simplification
-SIMPLIFY_EPSILON = 0.8
+DEFAULT_MIN_CONTOUR_LENGTH = 15
+DEFAULT_MIN_CONTOUR_AREA = 5
+DEFAULT_MIN_PATH_LENGTH = 1.5
 
-# Image cleanup
-MORPH_KERNEL_SIZE = 3
+DEFAULT_SIMPLIFY_EPSILON = 0.8
 
-# Remove points that are extremely close
-MIN_POINT_DISTANCE = 0.2
+DEFAULT_MORPH_KERNEL_SIZE = 3
+
+DEFAULT_MIN_POINT_DISTANCE = 0.2
 
 
 # ============================================================
@@ -115,7 +113,7 @@ def process_image():
         cv2.COLOR_BGR2GRAY
     )
 
-    # Slight blur removes tiny pixel noise
+    # Slight blur
     gray = cv2.GaussianBlur(
         gray,
         (3, 3),
@@ -208,7 +206,7 @@ def show_image(img):
     pil = Image.fromarray(display)
 
     pil.thumbnail(
-        (450, 350)
+        (450, 300)
     )
 
     photo = ImageTk.PhotoImage(
@@ -238,7 +236,10 @@ def distance(a, b):
 # REMOVE CLOSE POINTS
 # ============================================================
 
-def remove_close_points(path):
+def remove_close_points(
+    path,
+    min_distance
+):
 
     if len(path) < 2:
         return path
@@ -252,7 +253,7 @@ def remove_close_points(path):
         if distance(
             cleaned[-1],
             point
-        ) >= MIN_POINT_DISTANCE:
+        ) >= min_distance:
 
             cleaned.append(
                 point
@@ -288,7 +289,6 @@ def calculate_path_length(
             y2 - y1
         )
 
-    # Close contour
     if closed and len(path) >= 3:
 
         x1, y1 = path[-1]
@@ -303,7 +303,7 @@ def calculate_path_length(
 
 
 # ============================================================
-# CONTOUR EXTRACTION
+# GENERATE TOOLPATHS
 # ============================================================
 
 def generate_toolpaths():
@@ -320,7 +320,7 @@ def generate_toolpaths():
         return
 
     # ========================================================
-    # VALIDATE SIZE
+    # READ SETTINGS
     # ========================================================
 
     try:
@@ -333,59 +333,129 @@ def generate_toolpaths():
             height_var.get()
         )
 
+        simplify_epsilon = float(
+            simplify_var.get()
+        )
+
+        min_contour_length = float(
+            min_contour_length_var.get()
+        )
+
+        min_contour_area = float(
+            min_contour_area_var.get()
+        )
+
+        min_path_length = float(
+            min_path_length_var.get()
+        )
+
+        min_point_distance = float(
+            min_point_distance_var.get()
+        )
+
+        morph_kernel_size = int(
+            morph_kernel_var.get()
+        )
+
     except ValueError:
 
         messagebox.showerror(
             "Error",
-            "Invalid plot width or height."
-        )
-
-        return
-
-    if width_mm <= 0 or height_mm <= 0:
-
-        messagebox.showerror(
-            "Error",
-            "Plot width and height must be greater than zero."
+            "One or more settings are invalid."
         )
 
         return
 
     # ========================================================
-    # COPY IMAGE
+    # VALIDATE
+    # ========================================================
+
+    if width_mm <= 0:
+
+        messagebox.showerror(
+            "Error",
+            "Plot width must be greater than zero."
+        )
+
+        return
+
+    if height_mm <= 0:
+
+        messagebox.showerror(
+            "Error",
+            "Plot height must be greater than zero."
+        )
+
+        return
+
+    if simplify_epsilon < 0:
+
+        messagebox.showerror(
+            "Error",
+            "Simplify epsilon cannot be negative."
+        )
+
+        return
+
+    if min_contour_length < 0:
+
+        messagebox.showerror(
+            "Error",
+            "Minimum contour length cannot be negative."
+        )
+
+        return
+
+    if min_contour_area < 0:
+
+        messagebox.showerror(
+            "Error",
+            "Minimum contour area cannot be negative."
+        )
+
+        return
+
+    if min_path_length < 0:
+
+        messagebox.showerror(
+            "Error",
+            "Minimum path length cannot be negative."
+        )
+
+        return
+
+    if min_point_distance < 0:
+
+        messagebox.showerror(
+            "Error",
+            "Minimum point distance cannot be negative."
+        )
+
+        return
+
+    # OpenCV kernels must be odd
+    if morph_kernel_size < 1:
+
+        morph_kernel_size = 1
+
+    if morph_kernel_size % 2 == 0:
+
+        morph_kernel_size += 1
+
+    # ========================================================
+    # CREATE BINARY IMAGE
     # ========================================================
 
     img = image_processed.copy()
 
     mode = processing_mode.get()
 
-    # ========================================================
-    # CREATE BINARY IMAGE
-    # ========================================================
-
     if mode == "Edge Detection":
 
-        # Canny already gives a binary image
         binary = img.copy()
-
-        # Close small gaps in edge lines
-        kernel = np.ones(
-            (
-                MORPH_KERNEL_SIZE,
-                MORPH_KERNEL_SIZE
-            ),
-            np.uint8
-        )
-
-        binary = cv2.morphologyEx(
-            binary,
-            cv2.MORPH_CLOSE,
-            kernel
-        )
 
     else:
 
-        # Convert black areas to white
         _, binary = cv2.threshold(
             img,
             127,
@@ -393,22 +463,28 @@ def generate_toolpaths():
             cv2.THRESH_BINARY_INV
         )
 
+    # ========================================================
+    # MORPHOLOGICAL CLEANUP
+    # ========================================================
+
+    if morph_kernel_size > 1:
+
         kernel = np.ones(
             (
-                MORPH_KERNEL_SIZE,
-                MORPH_KERNEL_SIZE
+                morph_kernel_size,
+                morph_kernel_size
             ),
             np.uint8
         )
 
-        # Remove tiny isolated noise
+        # OPEN removes small noise
         binary = cv2.morphologyEx(
             binary,
             cv2.MORPH_OPEN,
             kernel
         )
 
-        # Connect small gaps
+        # CLOSE fills tiny gaps
         binary = cv2.morphologyEx(
             binary,
             cv2.MORPH_CLOSE,
@@ -437,13 +513,7 @@ def generate_toolpaths():
 
         return
 
-    hierarchy = hierarchy[0]
-
     h, w = binary.shape
-
-    # ========================================================
-    # PIXEL → MM SCALE
-    # ========================================================
 
     scale_x = width_mm / w
     scale_y = height_mm / h
@@ -454,13 +524,13 @@ def generate_toolpaths():
     # PROCESS CONTOURS
     # ========================================================
 
-    for i, contour in enumerate(contours):
+    for contour in contours:
 
         if len(contour) < 3:
             continue
 
         # ----------------------------------------------------
-        # AREA FILTER
+        # AREA
         # ----------------------------------------------------
 
         area = abs(
@@ -469,7 +539,7 @@ def generate_toolpaths():
             )
         )
 
-        if area < MIN_CONTOUR_AREA:
+        if area < min_contour_area:
             continue
 
         # ----------------------------------------------------
@@ -481,7 +551,7 @@ def generate_toolpaths():
             True
         )
 
-        if perimeter < MIN_CONTOUR_LENGTH:
+        if perimeter < min_contour_length:
             continue
 
         # ----------------------------------------------------
@@ -490,7 +560,7 @@ def generate_toolpaths():
 
         simplified = cv2.approxPolyDP(
             contour,
-            SIMPLIFY_EPSILON,
+            simplify_epsilon,
             True
         )
 
@@ -528,14 +598,15 @@ def generate_toolpaths():
         # ----------------------------------------------------
 
         path = remove_close_points(
-            path
+            path,
+            min_point_distance
         )
 
         if len(path) < 3:
             continue
 
         # ----------------------------------------------------
-        # LENGTH FILTER
+        # LENGTH
         # ----------------------------------------------------
 
         length = calculate_path_length(
@@ -543,7 +614,7 @@ def generate_toolpaths():
             closed=True
         )
 
-        if length < MIN_PATH_LENGTH:
+        if length < min_path_length:
             continue
 
         paths.append(
@@ -559,7 +630,7 @@ def generate_toolpaths():
     )
 
     # ========================================================
-    # OPTIMIZE PATH ORDER
+    # OPTIMIZE
     # ========================================================
 
     toolpaths = optimize_paths(
@@ -590,7 +661,8 @@ def remove_duplicate_paths(paths):
 
     for path in paths:
 
-        is_duplicate = False
+        if len(path) < 3:
+            continue
 
         xs = [
             p[0]
@@ -604,12 +676,13 @@ def remove_duplicate_paths(paths):
 
         min_x = min(xs)
         max_x = max(xs)
-
         min_y = min(ys)
         max_y = max(ys)
 
         width = max_x - min_x
         height = max_y - min_y
+
+        is_duplicate = False
 
         for existing in unique:
 
@@ -631,10 +704,6 @@ def remove_duplicate_paths(paths):
 
             e_width = e_max_x - e_min_x
             e_height = e_max_y - e_min_y
-
-            # ------------------------------------------------
-            # Compare bounding boxes
-            # ------------------------------------------------
 
             if (
                 abs(
@@ -693,7 +762,7 @@ def reverse_path(path):
 
 
 # ============================================================
-# PATH OPTIMIZATION
+# OPTIMIZE PATHS
 # ============================================================
 
 def optimize_paths(paths):
@@ -722,10 +791,6 @@ def optimize_paths(paths):
         )
 
         best_reverse = False
-
-        # ----------------------------------------------------
-        # FIND CLOSEST PATH
-        # ----------------------------------------------------
 
         for i, path in enumerate(
             remaining
@@ -757,17 +822,9 @@ def optimize_paths(paths):
 
                 best_reverse = True
 
-        # ----------------------------------------------------
-        # REMOVE PATH
-        # ----------------------------------------------------
-
         path = remaining.pop(
             best_index
         )
-
-        # ----------------------------------------------------
-        # REVERSE IF CLOSER
-        # ----------------------------------------------------
 
         if best_reverse:
 
@@ -830,7 +887,7 @@ def draw_toolpath_preview():
     ) / 2
 
     # ========================================================
-    # PLOT BOUNDARY
+    # BORDER
     # ========================================================
 
     canvas.create_rectangle(
@@ -840,11 +897,11 @@ def draw_toolpath_preview():
         offset_y + height * scale
     )
 
-    # ========================================================
-    # DRAW PATHS
-    # ========================================================
-
     previous_end = None
+
+    # ========================================================
+    # PATHS
+    # ========================================================
 
     for path in toolpaths:
 
@@ -889,7 +946,7 @@ def draw_toolpath_preview():
             )
 
         # ----------------------------------------------------
-        # DRAW CONTOUR
+        # DRAW PATH
         # ----------------------------------------------------
 
         points = []
@@ -913,7 +970,7 @@ def draw_toolpath_preview():
                 ]
             )
 
-        # Close contour in preview
+        # Close contour
         x0, y0 = path[0]
 
         points.extend(
@@ -953,7 +1010,7 @@ def refresh_ports():
 
 
 # ============================================================
-# CONNECT SERIAL
+# CONNECT
 # ============================================================
 
 def connect_serial():
@@ -986,7 +1043,6 @@ def connect_serial():
             timeout=5
         )
 
-        # Arduino reset delay
         time.sleep(2)
 
         ser.reset_input_buffer()
@@ -1030,7 +1086,6 @@ def send_command(command):
 
         ser.flush()
 
-        # Wait for Arduino response
         ser.readline()
 
         return True
@@ -1124,9 +1179,9 @@ def plot_thread():
 
     try:
 
-        # ====================================================
+        # ----------------------------------------------------
         # HOME
-        # ====================================================
+        # ----------------------------------------------------
 
         send_command(
             "HOME"
@@ -1136,17 +1191,17 @@ def plot_thread():
             0.5
         )
 
-        # ====================================================
+        # ----------------------------------------------------
         # PEN UP
-        # ====================================================
+        # ----------------------------------------------------
 
         send_command(
             "PENUP"
         )
 
-        # ====================================================
+        # ----------------------------------------------------
         # PATHS
-        # ====================================================
+        # ----------------------------------------------------
 
         for path_number, path in enumerate(
             toolpaths
@@ -1159,7 +1214,7 @@ def plot_thread():
                 continue
 
             # ------------------------------------------------
-            # MOVE TO FIRST POINT
+            # MOVE TO START
             # ------------------------------------------------
 
             x, y = path[0]
@@ -1179,9 +1234,6 @@ def plot_thread():
 
             # ------------------------------------------------
             # DRAW
-            # ------------------------------------------------
-            # Start at second point because the first point
-            # has already been reached.
             # ------------------------------------------------
 
             for x, y in path[1:]:
@@ -1208,9 +1260,9 @@ def plot_thread():
                 f"{len(toolpaths)}"
             )
 
-        # ====================================================
-        # RETURN HOME
-        # ====================================================
+        # ----------------------------------------------------
+        # HOME
+        # ----------------------------------------------------
 
         if plotting:
 
@@ -1281,7 +1333,7 @@ root.title(
 )
 
 root.geometry(
-    "1050x650"
+    "1150x700"
 )
 
 
@@ -1302,14 +1354,14 @@ left.pack(
 
 
 # ============================================================
-# OPEN IMAGE
+# IMAGE
 # ============================================================
 
 tk.Button(
     left,
     text="OPEN IMAGE",
     command=open_image,
-    width=25
+    width=27
 ).pack(
     pady=5
 )
@@ -1321,10 +1373,17 @@ tk.Button(
 
 tk.Label(
     left,
-    text="Processing"
+    text="PROCESSING",
+    font=("Arial", 11, "bold")
 ).pack(
-    pady=(10, 0)
+    pady=(10, 3)
 )
+
+
+tk.Label(
+    left,
+    text="Mode"
+).pack()
 
 
 processing_mode = ttk.Combobox(
@@ -1335,15 +1394,13 @@ processing_mode = ttk.Combobox(
         "Adaptive"
     ],
     state="readonly",
-    width=22
+    width=24
 )
 
-processing_mode.current(
-    0
-)
+processing_mode.current(0)
 
 processing_mode.pack(
-    pady=5
+    pady=3
 )
 
 processing_mode.bind(
@@ -1359,12 +1416,15 @@ processing_mode.bind(
 tk.Label(
     left,
     text="Threshold"
-).pack()
+).pack(
+    pady=(5, 0)
+)
 
 
 threshold_var = tk.IntVar(
-    value=150
+    value=DEFAULT_THRESHOLD
 )
+
 
 tk.Scale(
     left,
@@ -1372,7 +1432,157 @@ tk.Scale(
     to=255,
     orient="horizontal",
     variable=threshold_var,
-    command=lambda x: process_image()
+    command=lambda x: process_image(),
+    length=190
+).pack()
+
+
+# ============================================================
+# VECTOR SETTINGS
+# ============================================================
+
+tk.Label(
+    left,
+    text="VECTOR SETTINGS",
+    font=("Arial", 11, "bold")
+).pack(
+    pady=(12, 3)
+)
+
+
+# Simplify
+
+tk.Label(
+    left,
+    text="Simplify Epsilon"
+).pack()
+
+
+simplify_var = tk.StringVar(
+    value=str(
+        DEFAULT_SIMPLIFY_EPSILON
+    )
+)
+
+tk.Entry(
+    left,
+    textvariable=simplify_var,
+    width=27
+).pack()
+
+
+# Minimum contour length
+
+tk.Label(
+    left,
+    text="Min Contour Length"
+).pack(
+    pady=(5, 0)
+)
+
+
+min_contour_length_var = tk.StringVar(
+    value=str(
+        DEFAULT_MIN_CONTOUR_LENGTH
+    )
+)
+
+tk.Entry(
+    left,
+    textvariable=min_contour_length_var,
+    width=27
+).pack()
+
+
+# Minimum contour area
+
+tk.Label(
+    left,
+    text="Min Contour Area"
+).pack(
+    pady=(5, 0)
+)
+
+
+min_contour_area_var = tk.StringVar(
+    value=str(
+        DEFAULT_MIN_CONTOUR_AREA
+    )
+)
+
+tk.Entry(
+    left,
+    textvariable=min_contour_area_var,
+    width=27
+).pack()
+
+
+# Minimum path length
+
+tk.Label(
+    left,
+    text="Min Path Length (mm)"
+).pack(
+    pady=(5, 0)
+)
+
+
+min_path_length_var = tk.StringVar(
+    value=str(
+        DEFAULT_MIN_PATH_LENGTH
+    )
+)
+
+tk.Entry(
+    left,
+    textvariable=min_path_length_var,
+    width=27
+).pack()
+
+
+# Minimum point distance
+
+tk.Label(
+    left,
+    text="Min Point Distance (mm)"
+).pack(
+    pady=(5, 0)
+)
+
+
+min_point_distance_var = tk.StringVar(
+    value=str(
+        DEFAULT_MIN_POINT_DISTANCE
+    )
+)
+
+tk.Entry(
+    left,
+    textvariable=min_point_distance_var,
+    width=27
+).pack()
+
+
+# Morphological kernel
+
+tk.Label(
+    left,
+    text="Morph Kernel Size"
+).pack(
+    pady=(5, 0)
+)
+
+
+morph_kernel_var = tk.StringVar(
+    value=str(
+        DEFAULT_MORPH_KERNEL_SIZE
+    )
+)
+
+tk.Entry(
+    left,
+    textvariable=morph_kernel_var,
+    width=27
 ).pack()
 
 
@@ -1382,35 +1592,50 @@ tk.Scale(
 
 tk.Label(
     left,
-    text="Plot Width (mm)"
+    text="PLOT SIZE",
+    font=("Arial", 11, "bold")
 ).pack(
-    pady=(15, 0)
+    pady=(12, 3)
 )
 
+
+tk.Label(
+    left,
+    text="Plot Width (mm)"
+).pack()
+
+
 width_var = tk.StringVar(
-    value=str(DEFAULT_WIDTH)
+    value=str(
+        DEFAULT_WIDTH
+    )
 )
 
 tk.Entry(
     left,
     textvariable=width_var,
-    width=25
+    width=27
 ).pack()
 
 
 tk.Label(
     left,
     text="Plot Height (mm)"
-).pack()
+).pack(
+    pady=(5, 0)
+)
+
 
 height_var = tk.StringVar(
-    value=str(DEFAULT_HEIGHT)
+    value=str(
+        DEFAULT_HEIGHT
+    )
 )
 
 tk.Entry(
     left,
     textvariable=height_var,
-    width=25
+    width=27
 ).pack()
 
 
@@ -1420,35 +1645,50 @@ tk.Entry(
 
 tk.Label(
     left,
-    text="X Steps/mm"
+    text="CALIBRATION",
+    font=("Arial", 11, "bold")
 ).pack(
-    pady=(15, 0)
+    pady=(12, 3)
 )
 
+
+tk.Label(
+    left,
+    text="X Steps/mm"
+).pack()
+
+
 x_steps_var = tk.StringVar(
-    value=str(DEFAULT_X_STEPS_MM)
+    value=str(
+        DEFAULT_X_STEPS_MM
+    )
 )
 
 tk.Entry(
     left,
     textvariable=x_steps_var,
-    width=25
+    width=27
 ).pack()
 
 
 tk.Label(
     left,
     text="Y Steps/mm"
-).pack()
+).pack(
+    pady=(5, 0)
+)
+
 
 y_steps_var = tk.StringVar(
-    value=str(DEFAULT_Y_STEPS_MM)
+    value=str(
+        DEFAULT_Y_STEPS_MM
+    )
 )
 
 tk.Entry(
     left,
     textvariable=y_steps_var,
-    width=25
+    width=27
 ).pack()
 
 
@@ -1458,35 +1698,50 @@ tk.Entry(
 
 tk.Label(
     left,
-    text="Pen Up Angle"
+    text="PEN",
+    font=("Arial", 11, "bold")
 ).pack(
-    pady=(15, 0)
+    pady=(12, 3)
 )
 
+
+tk.Label(
+    left,
+    text="Pen Up Angle"
+).pack()
+
+
 pen_up_var = tk.StringVar(
-    value=str(DEFAULT_PEN_UP)
+    value=str(
+        DEFAULT_PEN_UP
+    )
 )
 
 tk.Entry(
     left,
     textvariable=pen_up_var,
-    width=25
+    width=27
 ).pack()
 
 
 tk.Label(
     left,
     text="Pen Down Angle"
-).pack()
+).pack(
+    pady=(5, 0)
+)
+
 
 pen_down_var = tk.StringVar(
-    value=str(DEFAULT_PEN_DOWN)
+    value=str(
+        DEFAULT_PEN_DOWN
+    )
 )
 
 tk.Entry(
     left,
     textvariable=pen_down_var,
-    width=25
+    width=27
 ).pack()
 
 
@@ -1496,17 +1751,26 @@ tk.Entry(
 
 tk.Label(
     left,
-    text="Arduino Port"
+    text="SERIAL",
+    font=("Arial", 11, "bold")
 ).pack(
-    pady=(15, 0)
+    pady=(12, 3)
 )
 
+
+tk.Label(
+    left,
+    text="Arduino Port"
+).pack()
+
+
 port_var = tk.StringVar()
+
 
 port_combo = ttk.Combobox(
     left,
     textvariable=port_var,
-    width=22
+    width=24
 )
 
 port_combo.pack()
@@ -1525,7 +1789,7 @@ connect_button = tk.Button(
     left,
     text="Connect",
     command=connect_serial,
-    width=25
+    width=27
 )
 
 connect_button.pack(
@@ -1541,9 +1805,9 @@ tk.Button(
     left,
     text="GENERATE TOOLPATH",
     command=generate_toolpaths,
-    width=25
+    width=27
 ).pack(
-    pady=(15, 3)
+    pady=(12, 3)
 )
 
 
@@ -1551,7 +1815,7 @@ plot_button = tk.Button(
     left,
     text="PLOT",
     command=start_plot,
-    width=25
+    width=27
 )
 
 plot_button.pack(
@@ -1563,7 +1827,7 @@ tk.Button(
     left,
     text="STOP",
     command=stop_plot,
-    width=25
+    width=27
 ).pack(
     pady=3
 )
@@ -1604,8 +1868,8 @@ image_label.pack(
 
 canvas = tk.Canvas(
     right,
-    width=500,
-    height=400,
+    width=600,
+    height=450,
     bg="white"
 )
 
