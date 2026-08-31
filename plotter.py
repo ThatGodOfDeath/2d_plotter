@@ -25,18 +25,8 @@ DEFAULT_HEIGHT = 100
 DEFAULT_PEN_UP = 90
 DEFAULT_PEN_DOWN = 30
 
-# Toolpath filtering
-MIN_CONTOUR_LENGTH = 20
-MIN_PATH_LENGTH = 2.0
-
-# Contour simplification
-SIMPLIFY_EPSILON = 0.8
-
-# Morphological cleanup
-MORPH_KERNEL_SIZE = 3
-
-# Remove points that are extremely close together
-MIN_POINT_DISTANCE = 0.2
+MIN_CONTOUR_LENGTH = 10
+SIMPLIFY_EPSILON = 1.0
 
 
 # ============================================================
@@ -105,16 +95,12 @@ def process_image():
 
     img = image_original.copy()
 
-    # --------------------------------------------------------
-    # GRAYSCALE
-    # --------------------------------------------------------
-
     gray = cv2.cvtColor(
         img,
         cv2.COLOR_BGR2GRAY
     )
 
-    # Slight blur removes pixel-level noise
+    # Slight blur removes tiny image noise
     gray = cv2.GaussianBlur(
         gray,
         (3, 3),
@@ -139,7 +125,7 @@ def process_image():
         )
 
     # --------------------------------------------------------
-    # EDGE DETECTION
+    # EDGE
     # --------------------------------------------------------
 
     elif mode == "Edge Detection":
@@ -219,33 +205,6 @@ def show_image(img):
 
 
 # ============================================================
-# REMOVE CLOSE POINTS
-# ============================================================
-
-def remove_close_points(path):
-
-    if len(path) < 2:
-        return path
-
-    cleaned = [
-        path[0]
-    ]
-
-    for point in path[1:]:
-
-        if distance(
-            cleaned[-1],
-            point
-        ) >= MIN_POINT_DISTANCE:
-
-            cleaned.append(
-                point
-            )
-
-    return cleaned
-
-
-# ============================================================
 # CONTOUR EXTRACTION
 # ============================================================
 
@@ -262,51 +221,15 @@ def generate_toolpaths():
 
         return
 
-    # ========================================================
-    # VALIDATE SIZE
-    # ========================================================
-
-    try:
-
-        width_mm = float(
-            width_var.get()
-        )
-
-        height_mm = float(
-            height_var.get()
-        )
-
-    except ValueError:
-
-        messagebox.showerror(
-            "Error",
-            "Invalid plot width or height."
-        )
-
-        return
-
-    if width_mm <= 0 or height_mm <= 0:
-
-        messagebox.showerror(
-            "Error",
-            "Plot width and height must be greater than zero."
-        )
-
-        return
-
-    # ========================================================
-    # CREATE BINARY IMAGE
-    # ========================================================
-
     img = image_processed.copy()
 
+    # Make sure contours see white objects
     if processing_mode.get() == "Edge Detection":
 
-        binary = img.copy()
+        binary = img
 
     else:
 
-        # Convert black objects into white contours
         _, binary = cv2.threshold(
             img,
             127,
@@ -314,86 +237,59 @@ def generate_toolpaths():
             cv2.THRESH_BINARY_INV
         )
 
-    # ========================================================
-    # MORPHOLOGICAL CLEANUP
-    # ========================================================
-
-    kernel = np.ones(
-        (
-            MORPH_KERNEL_SIZE,
-            MORPH_KERNEL_SIZE
-        ),
-        np.uint8
-    )
-
-    # Remove isolated tiny noise
-    binary = cv2.morphologyEx(
-        binary,
-        cv2.MORPH_OPEN,
-        kernel
-    )
-
-    # Connect tiny gaps
-    binary = cv2.morphologyEx(
-        binary,
-        cv2.MORPH_CLOSE,
-        kernel
-    )
-
-    # ========================================================
+    # --------------------------------------------------------
     # FIND CONTOURS
-    # ========================================================
+    # --------------------------------------------------------
 
     contours, _ = cv2.findContours(
         binary,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
+        cv2.RETR_LIST,
+        cv2.CHAIN_APPROX_NONE
     )
 
     h, w = binary.shape
+
+    width_mm = float(
+        width_var.get()
+    )
+
+    height_mm = float(
+        height_var.get()
+    )
 
     scale_x = width_mm / w
     scale_y = height_mm / h
 
     paths = []
 
-    # ========================================================
-    # PROCESS EACH CONTOUR
-    # ========================================================
+    # --------------------------------------------------------
+    # CONVERT CONTOURS TO MM
+    # --------------------------------------------------------
 
     for contour in contours:
 
-        if len(contour) < 3:
+        if len(contour) < 2:
             continue
-
-        # ----------------------------------------------------
-        # CONTOUR PERIMETER
-        # ----------------------------------------------------
 
         perimeter = cv2.arcLength(
             contour,
-            True
+            False
         )
 
         if perimeter < MIN_CONTOUR_LENGTH:
             continue
 
-        # ----------------------------------------------------
-        # SIMPLIFY CONTOUR
-        # ----------------------------------------------------
+        epsilon = (
+            SIMPLIFY_EPSILON
+            * perimeter
+            / 100
+        )
 
         simplified = cv2.approxPolyDP(
             contour,
-            SIMPLIFY_EPSILON,
-            True
+            epsilon,
+            False
         )
-
-        if len(simplified) < 3:
-            continue
-
-        # ----------------------------------------------------
-        # CONVERT PIXELS → MM
-        # ----------------------------------------------------
 
         path = []
 
@@ -407,58 +303,33 @@ def generate_toolpaths():
                 p[0][1]
             )
 
+            # Image Y → plotter Y
             px = x * scale_x
             py = y * scale_y
 
             path.append(
-                (
-                    px,
-                    py
-                )
+                (px, py)
             )
 
-        # ----------------------------------------------------
-        # REMOVE VERY CLOSE POINTS
-        # ----------------------------------------------------
+        if len(path) >= 2:
 
-        path = remove_close_points(
-            path
-        )
+            length = calculate_path_length(
+                path
+            )
 
-        if len(path) < 3:
-            continue
+            if length > 1:
 
-        # ----------------------------------------------------
-        # CALCULATE LENGTH
-        # ----------------------------------------------------
+                paths.append(
+                    path
+                )
 
-        length = calculate_path_length(
-            path,
-            closed=True
-        )
-
-        if length < MIN_PATH_LENGTH:
-            continue
-
-        # ----------------------------------------------------
-        # STORE
-        # ----------------------------------------------------
-
-        paths.append(
-            path
-        )
-
-    # ========================================================
-    # OPTIMIZE PATH ORDER
-    # ========================================================
+    # --------------------------------------------------------
+    # OPTIMIZE PATHS
+    # --------------------------------------------------------
 
     toolpaths = optimize_paths(
         paths
     )
-
-    # ========================================================
-    # PREVIEW
-    # ========================================================
 
     draw_toolpath_preview()
 
@@ -471,34 +342,14 @@ def generate_toolpaths():
 # PATH LENGTH
 # ============================================================
 
-def calculate_path_length(
-    path,
-    closed=False
-):
-
-    if len(path) < 2:
-        return 0
+def calculate_path_length(path):
 
     total = 0
 
-    for i in range(
-        1,
-        len(path)
-    ):
+    for i in range(1, len(path)):
 
         x1, y1 = path[i - 1]
         x2, y2 = path[i]
-
-        total += math.hypot(
-            x2 - x1,
-            y2 - y1
-        )
-
-    # Close contour
-    if closed and len(path) >= 3:
-
-        x1, y1 = path[-1]
-        x2, y2 = path[0]
 
         total += math.hypot(
             x2 - x1,
@@ -540,30 +391,17 @@ def optimize_paths(paths):
     if not paths:
         return []
 
-    remaining = [
-        list(path)
-        for path in paths
-    ]
+    remaining = paths.copy()
 
     optimized = []
 
-    current = (
-        0,
-        0
-    )
+    current = (0, 0)
 
     while remaining:
 
         best_index = 0
-        best_distance = float(
-            "inf"
-        )
-
+        best_distance = float("inf")
         best_reverse = False
-
-        # ----------------------------------------------------
-        # FIND CLOSEST PATH
-        # ----------------------------------------------------
 
         for i, path in enumerate(
             remaining
@@ -591,17 +429,9 @@ def optimize_paths(paths):
                 best_index = i
                 best_reverse = True
 
-        # ----------------------------------------------------
-        # REMOVE PATH
-        # ----------------------------------------------------
-
         path = remaining.pop(
             best_index
         )
-
-        # ----------------------------------------------------
-        # REVERSE IF NEEDED
-        # ----------------------------------------------------
 
         if best_reverse:
 
@@ -631,19 +461,13 @@ def draw_toolpath_preview():
     if not toolpaths:
         return
 
-    try:
+    width = float(
+        width_var.get()
+    )
 
-        width = float(
-            width_var.get()
-        )
-
-        height = float(
-            height_var.get()
-        )
-
-    except ValueError:
-
-        return
+    height = float(
+        height_var.get()
+    )
 
     canvas_width = 500
     canvas_height = 400
@@ -663,9 +487,7 @@ def draw_toolpath_preview():
         height * scale
     ) / 2
 
-    # ========================================================
-    # PLOT BOUNDARY
-    # ========================================================
+    # Plot boundary
 
     canvas.create_rectangle(
         offset_x,
@@ -674,58 +496,12 @@ def draw_toolpath_preview():
         offset_y + height * scale
     )
 
-    # ========================================================
-    # DRAW TOOLPATHS
-    # ========================================================
-
-    previous_end = None
+    # Paths
 
     for path in toolpaths:
 
         if len(path) < 2:
             continue
-
-        # ----------------------------------------------------
-        # PEN-UP TRAVEL
-        # ----------------------------------------------------
-
-        if previous_end is not None:
-
-            start = path[0]
-
-            x1 = (
-                offset_x +
-                previous_end[0] * scale
-            )
-
-            y1 = (
-                offset_y +
-                previous_end[1] * scale
-            )
-
-            x2 = (
-                offset_x +
-                start[0] * scale
-            )
-
-            y2 = (
-                offset_y +
-                start[1] * scale
-            )
-
-            # Dashed line represents PEN UP movement
-            canvas.create_line(
-                x1,
-                y1,
-                x2,
-                y2,
-                dash=(3, 3),
-                width=1
-            )
-
-        # ----------------------------------------------------
-        # DRAW PATH
-        # ----------------------------------------------------
 
         points = []
 
@@ -742,28 +518,13 @@ def draw_toolpath_preview():
             )
 
             points.extend(
-                [
-                    sx,
-                    sy
-                ]
+                [sx, sy]
             )
-
-        # Close contour visually
-        x0, y0 = path[0]
-
-        points.extend(
-            [
-                offset_x + x0 * scale,
-                offset_y + y0 * scale
-            ]
-        )
 
         canvas.create_line(
             *points,
             width=1
         )
-
-        previous_end = path[-1]
 
 
 # ============================================================
@@ -784,10 +545,6 @@ def refresh_ports():
         port_combo.current(0)
 
 
-# ============================================================
-# CONNECT SERIAL
-# ============================================================
-
 def connect_serial():
 
     global ser
@@ -805,26 +562,13 @@ def connect_serial():
 
     try:
 
-        # Close previous connection
-        if ser is not None:
-
-            try:
-                ser.close()
-            except Exception:
-                pass
-
         ser = serial.Serial(
             port,
             BAUD_RATE,
             timeout=5
         )
 
-        # Arduino reset delay
         time.sleep(2)
-
-        # Clear any startup garbage
-        ser.reset_input_buffer()
-        ser.reset_output_buffer()
 
         status_var.set(
             f"Connected to {port}"
@@ -835,8 +579,6 @@ def connect_serial():
         )
 
     except Exception as e:
-
-        ser = None
 
         messagebox.showerror(
             "Connection Error",
@@ -856,15 +598,9 @@ def send_command(command):
     try:
 
         ser.write(
-            (
-                command +
-                "\n"
-            ).encode()
+            (command + "\n").encode()
         )
 
-        ser.flush()
-
-        # Wait for Arduino response
         response = ser.readline()
 
         return True
@@ -929,8 +665,7 @@ def start_plot():
 
     answer = messagebox.askyesno(
         "Start Plot",
-        "Make sure the pen is positioned at the HOME position.\n\n"
-        "Start plotting?"
+        "Make sure the pen is positioned at the HOME position.\n\nStart plotting?"
     )
 
     if not answer:
@@ -948,19 +683,15 @@ def start_plot():
     ).start()
 
 
-# ============================================================
-# PLOT THREAD
-# ============================================================
-
 def plot_thread():
 
     global plotting
 
     try:
 
-        # ====================================================
+        # ----------------------------------------------------
         # HOME
-        # ====================================================
+        # ----------------------------------------------------
 
         send_command(
             "HOME"
@@ -970,17 +701,17 @@ def plot_thread():
             0.5
         )
 
-        # ====================================================
+        # ----------------------------------------------------
         # PEN UP
-        # ====================================================
+        # ----------------------------------------------------
 
         send_command(
             "PENUP"
         )
 
-        # ====================================================
+        # ----------------------------------------------------
         # PATHS
-        # ====================================================
+        # ----------------------------------------------------
 
         for path_number, path in enumerate(
             toolpaths
@@ -992,9 +723,7 @@ def plot_thread():
             if len(path) < 2:
                 continue
 
-            # ------------------------------------------------
-            # MOVE TO FIRST POINT
-            # ------------------------------------------------
+            # Move to first point
 
             x, y = path[0]
 
@@ -1003,22 +732,15 @@ def plot_thread():
                 f"Y{mm_to_steps_y(y)}"
             )
 
-            # ------------------------------------------------
-            # PEN DOWN
-            # ------------------------------------------------
+            # Pen down
 
             send_command(
                 "PENDOWN"
             )
 
-            # ------------------------------------------------
-            # DRAW
-            # ------------------------------------------------
-            # Start from SECOND point because first point
-            # has already been reached.
-            # ------------------------------------------------
+            # Draw
 
-            for x, y in path[1:]:
+            for x, y in path:
 
                 if not plotting:
                     break
@@ -1028,9 +750,7 @@ def plot_thread():
                     f"Y{mm_to_steps_y(y)}"
                 )
 
-            # ------------------------------------------------
-            # PEN UP
-            # ------------------------------------------------
+            # Pen up
 
             send_command(
                 "PENUP"
@@ -1042,15 +762,11 @@ def plot_thread():
                 f"{len(toolpaths)}"
             )
 
-        # ====================================================
-        # RETURN HOME
-        # ====================================================
+        # ----------------------------------------------------
+        # HOME
+        # ----------------------------------------------------
 
         if plotting:
-
-            send_command(
-                "PENUP"
-            )
 
             send_command(
                 "HOME"
@@ -1063,8 +779,7 @@ def plot_thread():
     except Exception as e:
 
         status_var.set(
-            "Plot error: " +
-            str(e)
+            "Plot error: " + str(e)
         )
 
     plotting = False
@@ -1086,18 +801,8 @@ def stop_plot():
 
     if ser:
 
-        try:
-
-            send_command(
-                "PENUP"
-            )
-
-            send_command(
-                "HOME"
-            )
-
-        except Exception:
-            pass
+        send_command("PENUP")
+        send_command("HOME")
 
     status_var.set(
         "Plot stopped"
@@ -1135,10 +840,6 @@ left.pack(
 )
 
 
-# ============================================================
-# OPEN IMAGE
-# ============================================================
-
 tk.Button(
     left,
     text="OPEN IMAGE",
@@ -1148,10 +849,6 @@ tk.Button(
     pady=5
 )
 
-
-# ============================================================
-# PROCESSING
-# ============================================================
 
 tk.Label(
     left,
@@ -1185,10 +882,6 @@ processing_mode.bind(
     lambda e: process_image()
 )
 
-
-# ============================================================
-# THRESHOLD
-# ============================================================
 
 tk.Label(
     left,
@@ -1335,9 +1028,7 @@ tk.Label(
     pady=(15, 0)
 )
 
-
 port_var = tk.StringVar()
-
 
 port_combo = ttk.Combobox(
     left,
@@ -1450,10 +1141,6 @@ canvas.pack(
 )
 
 
-# ============================================================
-# STATUS
-# ============================================================
-
 status_var = tk.StringVar(
     value="Ready"
 )
@@ -1463,10 +1150,6 @@ tk.Label(
     textvariable=status_var
 ).pack()
 
-
-# ============================================================
-# START
-# ============================================================
 
 refresh_ports()
 
