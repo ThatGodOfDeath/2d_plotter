@@ -59,7 +59,21 @@ image_processed = None
 toolpaths = []
 
 ser = None
+
 plotting = False
+paused = False
+
+# Used to pause/resume the plotting thread
+pause_event = threading.Event()
+pause_event.set()
+
+# Current plotting position
+current_path_index = 0
+current_point_index = 1
+
+# Prevent plotting thread and manual commands from
+# accessing serial at the same time
+serial_lock = threading.Lock()
 
 
 # ============================================================
@@ -391,19 +405,76 @@ def show_image(img):
         display
     )
 
-    pil.thumbnail(
-        (620, 320)
+    image_preview_canvas.delete(
+        "all"
+    )
+
+    canvas_width = image_preview_canvas.winfo_width()
+    canvas_height = image_preview_canvas.winfo_height()
+
+    if canvas_width < 10:
+        canvas_width = 650
+
+    if canvas_height < 10:
+        canvas_height = 280
+
+    # --------------------------------------------------------
+    # KEEP ORIGINAL ASPECT RATIO
+    # --------------------------------------------------------
+
+    scale = min(
+        canvas_width / pil.width,
+        canvas_height / pil.height
+    )
+
+    new_width = max(
+        1,
+        int(pil.width * scale)
+    )
+
+    new_height = max(
+        1,
+        int(pil.height * scale)
+    )
+
+    pil = pil.resize(
+        (
+            new_width,
+            new_height
+        ),
+        Image.Resampling.LANCZOS
     )
 
     photo = ImageTk.PhotoImage(
         pil
     )
 
-    image_label.config(
-        image=photo
+    image_preview_canvas.create_image(
+        canvas_width / 2,
+        canvas_height / 2,
+        image=photo,
+        anchor="center"
     )
 
-    image_label.image = photo
+    image_preview_canvas.image = photo
+
+
+def resize_image_preview(event=None):
+
+    if image_original is None:
+        return
+
+    if image_processed is not None:
+
+        show_image(
+            image_processed
+        )
+
+    else:
+
+        show_image(
+            image_original
+        )
 
 
 # ============================================================
@@ -685,8 +756,6 @@ def clean_binary(
 
 # ============================================================
 # TRACE VECTOR PATHS
-#
-# PHOTO -> MANY SVG-LIKE PATHS
 # ============================================================
 
 def generate_trace_paths(
@@ -767,7 +836,6 @@ def generate_trace_paths(
         if perimeter < min_contour_length:
             continue
 
-        # epsilon is in pixels here
         epsilon_px = (
             simplify_epsilon
             / max(
@@ -910,8 +978,6 @@ def skeletonize(binary):
 
 # ============================================================
 # MEANINGFUL STROKES
-#
-# PHOTO -> EDGES -> STROKES
 # ============================================================
 
 def generate_stroke_paths(
@@ -1188,31 +1254,39 @@ def generate_toolpaths():
         return
 
     if min_contour_length < 0:
+
         messagebox.showerror(
             "Error",
             "Minimum contour length cannot be negative."
         )
+
         return
 
     if min_contour_area < 0:
+
         messagebox.showerror(
             "Error",
             "Minimum contour area cannot be negative."
         )
+
         return
 
     if min_path_length < 0:
+
         messagebox.showerror(
             "Error",
             "Minimum path length cannot be negative."
         )
+
         return
 
     if min_point_distance < 0:
+
         messagebox.showerror(
             "Error",
             "Minimum point distance cannot be negative."
         )
+
         return
 
     if morph_kernel_size < 1:
@@ -1537,8 +1611,14 @@ def draw_toolpath_preview():
 
         return
 
-    canvas_width = 650
-    canvas_height = 500
+    canvas_width = canvas.winfo_width()
+    canvas_height = canvas.winfo_height()
+
+    if canvas_width < 10:
+        canvas_width = 650
+
+    if canvas_height < 10:
+        canvas_height = 400
 
     scale = min(
         canvas_width / width,
@@ -1649,6 +1729,13 @@ def draw_toolpath_preview():
         previous_end = path[-1]
 
 
+def resize_toolpath_preview(event=None):
+
+    if toolpaths:
+
+        draw_toolpath_preview()
+
+
 # ============================================================
 # SERIAL
 # ============================================================
@@ -1662,7 +1749,7 @@ def refresh_ports():
         for p in ports
     ]
 
-    if ports:
+    if ports and not port_var.get():
 
         port_combo.current(
             0
@@ -1711,7 +1798,15 @@ def connect_serial():
         )
 
         connect_button.config(
-            text="Connected"
+            state="disabled"
+        )
+
+        disconnect_button.config(
+            state="normal"
+        )
+
+        manual_send_button.config(
+            state="normal"
         )
 
     except Exception as e:
@@ -1722,6 +1817,73 @@ def connect_serial():
             "Connection Error",
             str(e)
         )
+
+
+def disconnect_serial():
+
+    global ser
+    global plotting
+    global paused
+
+    if plotting:
+
+        plotting = False
+        paused = False
+
+        pause_event.set()
+
+        try:
+
+            with serial_lock:
+
+                if ser is not None and ser.is_open:
+
+                    ser.write(
+                        b"PENUP\n"
+                    )
+
+                    ser.flush()
+
+        except Exception:
+            pass
+
+    if ser is not None:
+
+        try:
+            ser.close()
+        except Exception:
+            pass
+
+    ser = None
+
+    connect_button.config(
+        state="normal"
+    )
+
+    disconnect_button.config(
+        state="disabled"
+    )
+
+    manual_send_button.config(
+        state="disabled"
+    )
+
+    pause_button.config(
+        state="disabled",
+        text="PAUSE"
+    )
+
+    stop_button.config(
+        state="normal"
+    )
+
+    plot_button.config(
+        state="normal"
+    )
+
+    status_var.set(
+        "Disconnected"
+    )
 
 
 # ============================================================
@@ -1735,22 +1897,68 @@ def send_command(command):
 
     try:
 
-        ser.write(
-            (
-                command +
-                "\n"
-            ).encode()
-        )
+        with serial_lock:
 
-        ser.flush()
+            if not ser.is_open:
+                return False
 
-        ser.readline()
+            ser.write(
+                (
+                    command.strip() +
+                    "\n"
+                ).encode()
+            )
+
+            ser.flush()
+
+            ser.readline()
 
         return True
 
     except Exception:
 
         return False
+
+
+# ============================================================
+# MANUAL COMMAND
+# ============================================================
+
+def send_manual_command():
+
+    command = manual_command_var.get().strip()
+
+    if not command:
+        return
+
+    if ser is None:
+
+        messagebox.showwarning(
+            "Warning",
+            "Connect Arduino first."
+        )
+
+        return
+
+    success = send_command(
+        command
+    )
+
+    if success:
+
+        status_var.set(
+            f"Sent: {command}"
+        )
+
+        manual_command_var.set(
+            ""
+        )
+
+    else:
+
+        status_var.set(
+            "Command failed"
+        )
 
 
 # ============================================================
@@ -1784,6 +1992,9 @@ def mm_to_steps_y(mm):
 def start_plot():
 
     global plotting
+    global paused
+    global current_path_index
+    global current_point_index
 
     if ser is None:
 
@@ -1816,9 +2027,29 @@ def start_plot():
         return
 
     plotting = True
+    paused = False
+
+    current_path_index = 0
+    current_point_index = 1
+
+    pause_event.set()
+
+    progress_bar["value"] = 0
+    progress_var.set(
+        "0%"
+    )
 
     plot_button.config(
         state="disabled"
+    )
+
+    pause_button.config(
+        state="normal",
+        text="PAUSE"
+    )
+
+    stop_button.config(
+        state="normal"
     )
 
     threading.Thread(
@@ -1834,6 +2065,9 @@ def start_plot():
 def plot_thread():
 
     global plotting
+    global paused
+    global current_path_index
+    global current_point_index
 
     try:
 
@@ -1849,9 +2083,29 @@ def plot_thread():
             "PENUP"
         )
 
+        # ----------------------------------------------------
+        # TOTAL POINTS
+        # ----------------------------------------------------
+
+        total_points = sum(
+            max(
+                1,
+                len(path) - 1
+            )
+            for path in toolpaths
+        )
+
+        completed_points = 0
+
+        # ----------------------------------------------------
+        # PATH LOOP
+        # ----------------------------------------------------
+
         for path_number, path in enumerate(
             toolpaths
         ):
+
+            current_path_index = path_number
 
             if not plotting:
                 break
@@ -1860,15 +2114,65 @@ def plot_thread():
                 continue
 
             # ------------------------------------------------
+            # WAIT IF PAUSED
+            # ------------------------------------------------
+
+            if paused:
+
+                pause_event.wait()
+
+                if not plotting:
+                    break
+
+                # Pen was lifted during pause.
+                # Put it back down before continuing.
+                send_command(
+                    "PENDOWN"
+                )
+
+            if not plotting:
+                break
+
+            # ------------------------------------------------
             # MOVE TO START
             # ------------------------------------------------
 
             x, y = path[0]
 
-            send_command(
+            success = send_command(
                 f"M X{mm_to_steps_x(x)} "
                 f"Y{mm_to_steps_y(y)}"
             )
+
+            if not success:
+
+                plotting = False
+                break
+
+            if not plotting:
+                break
+
+            # ------------------------------------------------
+            # WAIT IF PAUSED
+            # ------------------------------------------------
+
+            if paused:
+
+                send_command(
+                    "PENUP"
+                )
+
+                pause_event.wait()
+
+                if not plotting:
+                    break
+
+                send_command(
+                    "PENDOWN"
+                )
+
+            if not plotting:
+                break
 
             # ------------------------------------------------
             # PEN DOWN
@@ -1882,29 +2186,88 @@ def plot_thread():
             # DRAW
             # ------------------------------------------------
 
-            for x, y in path[1:]:
+            for point_number in range(
+                1,
+                len(path)
+            ):
+
+                current_point_index = point_number
 
                 if not plotting:
                     break
 
-                send_command(
+                # --------------------------------------------
+                # PAUSE CHECK
+                # --------------------------------------------
+
+                if paused:
+
+                    send_command(
+                        "PENUP"
+                    )
+
+                    pause_event.wait()
+
+                    if not plotting:
+                        break
+
+                    send_command(
+                        "PENDOWN"
+                    )
+
+                if not plotting:
+                    break
+
+                # --------------------------------------------
+                # MOVE
+                # --------------------------------------------
+
+                x, y = path[
+                    point_number
+                ]
+
+                success = send_command(
                     f"M X{mm_to_steps_x(x)} "
                     f"Y{mm_to_steps_y(y)}"
                 )
 
+                if not success:
+
+                    plotting = False
+                    break
+
+                completed_points += 1
+
+                percentage = (
+                    completed_points /
+                    total_points *
+                    100
+                )
+
+                root.after(
+                    0,
+                    update_plot_progress,
+                    percentage,
+                    path_number + 1,
+                    len(toolpaths),
+                    point_number,
+                    len(path) - 1
+                )
+
+            if not plotting:
+                break
+
             # ------------------------------------------------
-            # PEN UP
+            # PEN UP AFTER PATH
             # ------------------------------------------------
 
             send_command(
                 "PENUP"
             )
 
-            status_var.set(
-                f"Plotting path "
-                f"{path_number + 1}/"
-                f"{len(toolpaths)}"
-            )
+        # ----------------------------------------------------
+        # COMPLETE
+        # ----------------------------------------------------
 
         if plotting:
 
@@ -1916,22 +2279,149 @@ def plot_thread():
                 "HOME"
             )
 
-            status_var.set(
-                "Plot complete"
+            root.after(
+                0,
+                plot_finished
             )
 
     except Exception as e:
 
-        status_var.set(
-            "Plot error: " +
+        root.after(
+            0,
+            plot_error,
             str(e)
         )
 
-    plotting = False
+    finally:
+
+        plotting = False
+        paused = False
+
+        pause_event.set()
+
+        root.after(
+            0,
+            reset_plot_buttons
+        )
+
+
+# ============================================================
+# PROGRESS
+# ============================================================
+
+def update_plot_progress(
+    percentage,
+    current_path,
+    total_paths,
+    current_point,
+    total_path_points
+):
+
+    progress_bar["value"] = percentage
+
+    progress_var.set(
+        f"{percentage:.1f}%"
+    )
+
+    status_var.set(
+        f"Plotting path "
+        f"{current_path}/{total_paths} | "
+        f"Point {current_point}/{total_path_points} | "
+        f"{percentage:.1f}%"
+    )
+
+
+def plot_finished():
+
+    progress_bar["value"] = 100
+
+    progress_var.set(
+        "100%"
+    )
+
+    status_var.set(
+        "Plot complete"
+    )
+
+
+def plot_error(error):
+
+    status_var.set(
+        "Plot error: " + error
+    )
+
+
+def reset_plot_buttons():
 
     plot_button.config(
         state="normal"
     )
+
+    pause_button.config(
+        state="disabled",
+        text="PAUSE"
+    )
+
+    stop_button.config(
+        state="normal"
+    )
+
+
+# ============================================================
+# PAUSE / RESUME
+# ============================================================
+
+def toggle_pause():
+
+    global paused
+
+    if not plotting:
+        return
+
+    if not paused:
+
+        # ----------------------------------------------------
+        # PAUSE
+        # ----------------------------------------------------
+
+        paused = True
+
+        pause_event.clear()
+
+        pause_button.config(
+            text="RESUME"
+        )
+
+        status_var.set(
+            "Pausing..."
+        )
+
+        # Lift pen immediately
+        send_command(
+            "PENUP"
+        )
+
+        status_var.set(
+            "Drawing paused"
+        )
+
+    else:
+
+        # ----------------------------------------------------
+        # RESUME
+        # ----------------------------------------------------
+
+        paused = False
+
+        pause_event.set()
+
+        pause_button.config(
+            text="PAUSE"
+        )
+
+        status_var.set(
+            "Resuming..."
+        )
 
 
 # ============================================================
@@ -1941,26 +2431,49 @@ def plot_thread():
 def stop_plot():
 
     global plotting
+    global paused
+
+    if not plotting:
+
+        status_var.set(
+            "Plot stopped"
+        )
+
+        return
 
     plotting = False
+    paused = False
 
-    if ser:
+    pause_event.set()
 
-        try:
+    try:
 
-            send_command(
-                "PENUP"
-            )
+        send_command(
+            "PENUP"
+        )
 
-            send_command(
-                "HOME"
-            )
+        send_command(
+            "HOME"
+        )
 
-        except Exception:
-            pass
+    except Exception:
+        pass
+
+    progress_var.set(
+        "Stopped"
+    )
 
     status_var.set(
         "Plot stopped"
+    )
+
+    pause_button.config(
+        state="disabled",
+        text="PAUSE"
+    )
+
+    plot_button.config(
+        state="normal"
     )
 
 
@@ -2894,7 +3407,8 @@ port_var = tk.StringVar()
 port_combo = ttk.Combobox(
     serial_settings.content,
     textvariable=port_var,
-    width=27
+    width=27,
+    state="readonly"
 )
 
 port_combo.pack(
@@ -2921,6 +3435,81 @@ connect_button = tk.Button(
 
 connect_button.pack(
     pady=3
+)
+
+
+disconnect_button = tk.Button(
+    serial_settings.content,
+    text="Disconnect",
+    command=disconnect_serial,
+    width=30,
+    state="disabled"
+)
+
+disconnect_button.pack(
+    pady=3
+)
+
+
+# ============================================================
+# MANUAL COMMAND
+# ============================================================
+
+tk.Label(
+    serial_settings.content,
+    text="Manual Command",
+    font=("Arial", 9, "bold")
+).pack(
+    pady=(10, 2)
+)
+
+
+manual_command_var = tk.StringVar()
+
+
+manual_command_entry = tk.Entry(
+    serial_settings.content,
+    textvariable=manual_command_var,
+    width=30
+)
+
+manual_command_entry.pack(
+    pady=3
+)
+
+
+manual_send_button = tk.Button(
+    serial_settings.content,
+    text="SEND COMMAND",
+    command=send_manual_command,
+    width=30,
+    state="disabled"
+)
+
+manual_send_button.pack(
+    pady=3
+)
+
+
+manual_command_entry.bind(
+    "<Return>",
+    lambda event: send_manual_command()
+)
+
+
+tk.Label(
+    serial_settings.content,
+    text=(
+        "Examples:\n"
+        "HOME\n"
+        "PENUP\n"
+        "PENDOWN\n"
+        "M X500 Y300"
+    ),
+    justify="left"
+).pack(
+    anchor="w",
+    pady=(4, 5)
 )
 
 
@@ -2975,14 +3564,69 @@ plot_button.pack(
 )
 
 
-tk.Button(
+pause_button = tk.Button(
+    actions.content,
+    text="PAUSE",
+    command=toggle_pause,
+    width=30,
+    height=2,
+    state="disabled"
+)
+
+pause_button.pack(
+    pady=4
+)
+
+
+stop_button = tk.Button(
     actions.content,
     text="STOP",
     command=stop_plot,
     width=30,
     height=2
-).pack(
+)
+
+stop_button.pack(
     pady=4
+)
+
+
+# ============================================================
+# PROGRESS
+# ============================================================
+
+tk.Label(
+    actions.content,
+    text="Plot Progress",
+    font=("Arial", 9, "bold")
+).pack(
+    pady=(8, 2)
+)
+
+
+progress_var = tk.StringVar(
+    value="0%"
+)
+
+
+progress_bar = ttk.Progressbar(
+    actions.content,
+    orient="horizontal",
+    mode="determinate",
+    length=240,
+    maximum=100
+)
+
+progress_bar.pack(
+    pady=3
+)
+
+
+tk.Label(
+    actions.content,
+    textvariable=progress_var
+).pack(
+    pady=(0, 5)
 )
 
 
@@ -3003,33 +3647,69 @@ right.pack(
 )
 
 
+# ============================================================
+# IMAGE PREVIEW
+# ============================================================
+
 tk.Label(
     right,
-    text="Image / Vector Toolpath Preview",
-    font=("Arial", 16)
+    text="Image Preview",
+    font=("Arial", 11, "bold")
 ).pack(
-    pady=5
+    pady=(3, 2)
 )
 
 
-image_label = tk.Label(
-    right
+image_preview_canvas = tk.Canvas(
+    right,
+    height=280,
+    bg="#eeeeee",
+    highlightthickness=1
 )
 
-image_label.pack(
-    pady=5
+image_preview_canvas.pack(
+    fill="x",
+    padx=5,
+    pady=3
+)
+
+
+image_preview_canvas.bind(
+    "<Configure>",
+    resize_image_preview
+)
+
+
+# ============================================================
+# TOOLPATH PREVIEW
+# ============================================================
+
+tk.Label(
+    right,
+    text="Vector Toolpath Preview",
+    font=("Arial", 11, "bold")
+).pack(
+    pady=(5, 2)
 )
 
 
 canvas = tk.Canvas(
     right,
     width=650,
-    height=500,
+    height=400,
     bg="white"
 )
 
 canvas.pack(
-    pady=5
+    fill="both",
+    expand=True,
+    pady=3
+)
+
+
+canvas.bind(
+    "<Configure>",
+    resize_toolpath_preview
 )
 
 
